@@ -120,6 +120,7 @@ CREATE TABLE audit.log (
     id BIGSERIAL PRIMARY KEY,
     schema_name TEXT NOT NULL,
     table_name TEXT NOT NULL,
+	row_id TEXT,
     relid OID NOT NULL,
     session_user_name TEXT NOT NULL,
     current_user_name TEXT NOT NULL,
@@ -148,6 +149,8 @@ COMMENT ON COLUMN audit.log.schema_name
   IS 'Database schema audited table for this event is in';
 COMMENT ON COLUMN audit.log.table_name
   IS 'Non-schema-qualified table name of table event occured in';
+COMMENT ON COLUMN audit.log.row_id
+  IS 'table_name primary key';
 COMMENT ON COLUMN audit.log.relid
   IS 'Table OID. Changes with drop/create. Get with ''tablename''::REGCLASS';
 COMMENT ON COLUMN audit.log.session_user_name
@@ -181,6 +184,7 @@ COMMENT ON COLUMN audit.log.changed_fields
 COMMENT ON COLUMN audit.log.statement_only
   IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
+CREATE INDEX row_id_idx ON audit.log(row_id);
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
@@ -212,7 +216,8 @@ BEGIN
     nextval('audit.log_id_seq'),                    -- id
     TG_TABLE_SCHEMA::TEXT,                          -- schema_name
     TG_TABLE_NAME::TEXT,                            -- table_name
-    TG_RELID,                                       -- relation OID for faster searches
+    NULL,											-- row_id
+	TG_RELID,                                       -- relation OID for faster searches
     session_user::TEXT,                             -- session_user_name
     current_user::TEXT,                             -- current_user_name
     current_timestamp,                              -- action_tstamp_tx
@@ -240,10 +245,19 @@ BEGIN
 
   IF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
     audit_row.changed_fields = to_jsonb(NEW.*) - excluded_cols;
+	
+	IF TG_ARGV[2] IS NOT NULL THEN
+	  audit_row.row_id = to_json(NEW)->>TG_ARGV[2];
+	END IF;
   ELSIF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
     audit_row.row_data = to_jsonb(OLD.*) - excluded_cols;
     audit_row.changed_fields =
       (to_jsonb(NEW.*) - audit_row.row_data) - excluded_cols;
+	
+	IF TG_ARGV[2] IS NOT NULL THEN
+	  audit_row.row_id = to_json(OLD)->>TG_ARGV[2];
+	END IF;
+	
     IF audit_row.changed_fields = '{}'::JSONB THEN
       -- All changed fields are ignored. Skip this update.
       RETURN NULL;
@@ -286,6 +300,8 @@ param 1: TEXT[], columns to ignore in updates. Default [].
          that do not exist in the target table. This lets you specify
          a standard set of ignored columns.
 
+param 2: TEXT, See all row_id coments.
+
 There is no parameter to disable logging of values. Add this trigger as
 a 'FOR EACH STATEMENT' rather than 'FOR EACH ROW' trigger if you do not
 want to log row values.
@@ -302,7 +318,8 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
   target_table REGCLASS,
   audit_rows BOOLEAN,
   audit_query_text BOOLEAN,
-  ignored_cols TEXT[]
+  ignored_cols TEXT[], 
+  row_id TEXT
 )
 RETURNS VOID
 LANGUAGE 'plpgsql'
@@ -311,9 +328,18 @@ DECLARE
   stm_targets TEXT = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
   _q_txt TEXT;
   _ignored_cols_snip TEXT = '';
+  _row_id TEXT = '';
 BEGIN
   EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table::TEXT;
   EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table::TEXT;
+
+  IF 0 != LENGTH(row_id) THEN 
+	IF 0 != LENGTH(_ignored_cols_snip) THEN 
+		_row_id = ', ' || row_id; 
+	ELSE
+		_row_id = ', ''{}'', ' || row_id; 
+	END IF;
+  END IF;
 
   IF audit_rows THEN
     IF array_length(ignored_cols,1) > 0 THEN
@@ -325,6 +351,7 @@ BEGIN
              ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
              quote_literal(audit_query_text) ||
              _ignored_cols_snip ||
+             _row_id::TEXT ||
              ');';
     RAISE NOTICE '%', _q_txt;
     EXECUTE _q_txt;
@@ -340,7 +367,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[]) IS $$
+COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[], TEXT) IS $$
 Add auditing support to a table.
 
 Arguments:
@@ -350,6 +377,8 @@ Arguments:
                      the audit event?
    ignored_cols:     Columns to exclude from update diffs,
                      ignore updates that change only ignored cols.
+   row_id:     		Column where the user can use to create an index or 
+					 to store the target table id for outside queries.
 $$;
 
 --
@@ -363,7 +392,7 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
 RETURNS VOID
 LANGUAGE SQL
 AS $$
-  SELECT audit.audit_table($1, $2, $3, ARRAY[]::TEXT[]);
+  SELECT audit.audit_table($1, $2, $3, ARRAY[]::TEXT[], ''::TEXT);
 $$;
 
 --
@@ -374,10 +403,28 @@ CREATE OR REPLACE FUNCTION audit.audit_table(target_table REGCLASS)
 RETURNS VOID
 LANGUAGE 'sql'
 AS $$
-  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't');
+  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::TEXT[], ''::TEXT);
 $$;
 
 COMMENT ON FUNCTION audit.audit_table(REGCLASS) IS $$
 Add auditing support to the given table. Row-level changes will be logged with
 full client query text. No cols are ignored.
+$$;
+
+
+-- ADDED BY Westr5ac Ltd.
+-- And provide a convenience call wrapper for the simplest 
+-- case of row-level logging with no excluded cols and query 
+-- logging logging enabled and accept custom column to use for indexing.
+--
+CREATE OR REPLACE FUNCTION audit.audit_table(target_table REGCLASS, row_id TEXT )
+RETURNS VOID
+LANGUAGE 'sql'
+AS $$
+  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::TEXT[], $2);
+$$;
+
+COMMENT ON FUNCTION audit.audit_table(REGCLASS, TEXT) IS $$
+Add auditing support to the given table. Row-level changes will be logged with
+full client query text. No cols are ignored. Indexing row added
 $$;
